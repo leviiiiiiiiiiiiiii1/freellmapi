@@ -1,0 +1,715 @@
+instrument {
+    name = "OTC M1 EMA SMA RETRACAO v21 AGRESSIVO",
+    short_name = "EMA-SMA-RETR21A",
+    overlay = true
+}
+
+-- ============================================================================
+-- v21 AUDITADA: correcoes de QCS 1.1.0 + score descorrelacionado + price action
+-- Preserva toda logica central da v20. Entrada na proxima vela apos confirmacao [1].
+-- PRESET AGRESSIVO: +40-60% sinais vs v21 conservadora. Mantem score descorrelacionado mas relaxa filtros.
+-- ============================================================================
+
+input_group {
+    "GERAL",
+    min_score = input(5, "Pontuacao minima (0-10) [AGRESSIVO=5]", input.integer, 4, 9),
+    min_gap = input(1, "Intervalo entre sinais [AGRESSIVO=1]", input.integer, 0, 10),
+    show_pre = input(0, "Avisos preliminares", input.integer, 0, 1),
+    use_open_filter = input(0, "Filtro de abertura", input.integer, 0, 1),
+    use_correct_plot = input(0, "Seta no candle do gatilho (1=sim)", input.integer, 0, 1)
+}
+
+input_group {
+    "TENDENCIA E RETRACAO",
+    fast_len = input(9, "EMA rapida", input.integer, 5, 30),
+    slow_len = input(21, "EMA lenta", input.integer, 10, 100),
+    sma_len = input(50, "SMA de tendencia", input.integer, 20, 200),
+    trend_lookback = input(3, "Candles para inclinacao", input.integer, 2, 6),
+    trend_slope_thr = input(0.07, "Inclinacao minima em ATR [AGRESSIVO=0.07]", input.double, 0.05, 0.30, 0.01),
+    use_inclination = input(1, "Usar inclinacao normalizada", input.integer, 0, 1),
+    pullback_atr = input(0.50, "Tolerancia do toque em ATR", input.double, 0.10, 1.00, 0.05),
+    max_slow_ema_penetration = input(0.50, "Penetracao maxima da EMA lenta em ATR", input.double, 0.10, 1.00, 0.05),
+    max_pullback_range_atr = input(1.50, "Range maximo do candle de retracao em ATR", input.double, 0.50, 3.00, 0.10),
+    max_extension_atr = input(1.50, "Distancia maxima da EMA rapida em ATR [AGRESSIVO=1.50]", input.double, 0.5, 3.0, 0.1),
+    min_body_ratio = input(0.40, "Corpo minimo do candle de confirmacao", input.double, 0.20, 0.80, 0.05),
+    retracement_close_position = input(0.65, "Fechamento minimo apos retracao", input.double, 0.50, 0.90, 0.05)
+}
+
+input_group {
+    "FILTRO DE LATERALIZACAO",
+    use_chop_filter = input(1, "Bloquear mercado lateral", input.integer, 0, 1),
+    chop_len = input(14, "Periodo lateralizacao", input.integer, 5, 50),
+    max_chop = input(65.0, "Limite maximo Choppiness [AGRESSIVO=65]", input.double, 40, 75)
+}
+
+input_group {
+    "FILTRO DE TOPO E FUNDO",
+    swing_lookback = input(12, "Candles para maxima e minima", input.integer, 5, 30),
+    extreme_buffer_atr = input(0.25, "Distancia do extremo em ATR", input.double, 0.05, 1.00, 0.05)
+}
+
+input_group {
+    "MOMENTUM E VOLATILIDADE",
+    rsi_len = input(7, "Periodo RSI", input.integer, 5, 21),
+    atr_len = input(14, "Periodo ATR", input.integer, 5, 50),
+    use_atr_filter = input(1, "Bloquear volatilidade extrema", input.integer, 0, 1)
+}
+
+input_group {
+    "EXAUSTAO",
+    use_exhaustion = input(1, "Bloquear exaustao", input.integer, 0, 1),
+    rsi_overbought = input(75, "RSI sobrecompra (bloqueia compra) [AGRESSIVO=75]", input.integer, 60, 80),
+    rsi_oversold = input(25, "RSI sobrevenda (bloqueia venda) [AGRESSIVO=25]", input.integer, 20, 40),
+    max_consecutive = input(4, "Max velas consecutivas mesma cor [AGRESSIVO=4]", input.integer, 2, 5)
+}
+
+input_group {
+    "PRICE ACTION",
+    use_price_action = input(1, "Usar engolfo/pin bar", input.integer, 0, 1),
+    pin_wick_mult = input(1.8, "Pavio pin vs corpo", input.double, 1.2, 3.0, 0.1)
+}
+
+input_group {
+    "VOLATILIDADE ADAPTATIVA",
+    use_vol_adaptive = input(1, "ATR noturno adaptativo", input.integer, 0, 1)
+}
+
+input_group {
+    "FLUXO ADX/DI",
+    use_flow_score = input(0, "Usar fluxo na pontuacao", input.integer, 0, 1),
+    flow_di_len = input(10, "Periodo DI", input.integer, 5, 30),
+    flow_adx_len = input(10, "Suavizacao ADX", input.integer, 5, 30),
+    flow_threshold = input(12, "ADX minimo para pontuar fluxo", input.double, 5, 40)
+}
+
+input_group {
+    "VISUAL",
+    sig_size_opt = input(2, "Tamanho das setas", input.integer, 1, 3),
+    pre_size_opt = input(2, "Tamanho dos avisos", input.integer, 1, 3),
+    buy_color = input { default = "#00E676", type = input.color },
+    sell_color = input { default = "#FF5252", type = input.color },
+    pre_color = input { default = "#FFFF00", type = input.color }
+}
+
+local SIG_SIZE = ({
+    shape_size.normal,
+    shape_size.large,
+    shape_size.huge
+})[sig_size_opt]
+
+local PRE_SIZE = ({
+    shape_size.normal,
+    shape_size.large,
+    shape_size.huge
+})[pre_size_opt]
+
+-- offset da seta: 0 = vela atual (entrada), 1 = vela do gatilho [1]
+local PLOT_OFFSET = use_correct_plot == 1 and 1 or 0
+
+-- INDICADORES BASE (QCS 1.1.0 compativel)
+local FAST_EMA = ema(close, fast_len)
+local SLOW_EMA = ema(close, slow_len)
+local SMA_LINE = sma(close, sma_len)
+local ATR_LINE = rma(tr, atr_len)
+local ATR_SMA = sma(ATR_LINE, 20)
+
+-- RSI Wilder via rma (CORRECAO: ssma -> rma, compativel QCS 1.1.0)
+local RSI_DELTA = change(close)
+local RSI_GAIN = rma(max(RSI_DELTA, 0), rsi_len)
+local RSI_LOSS = rma(max(-RSI_DELTA, 0), rsi_len)
+local RSI_LINE = iff(
+    RSI_LOSS == 0,
+    100,
+    iff(RSI_GAIN == 0, 0, 100 - 100 / (1 + RSI_GAIN / RSI_LOSS))
+)
+
+-- FLUXO ADX/DI com protecao divisao por zero
+local FLOW_UP_MOVE = change(high)
+local FLOW_DOWN_MOVE = -change(low)
+
+local FLOW_PDM = iff(
+    FLOW_UP_MOVE > FLOW_DOWN_MOVE and nz(FLOW_UP_MOVE) > 0,
+    FLOW_UP_MOVE,
+    0
+)
+
+local FLOW_MDM = iff(
+    FLOW_DOWN_MOVE > FLOW_UP_MOVE and nz(FLOW_DOWN_MOVE) > 0,
+    FLOW_DOWN_MOVE,
+    0
+)
+
+local FLOW_ATR = rma(tr, flow_di_len)
+local FLOW_ATR_SAFE = max(FLOW_ATR, 0.00000001)
+local FLOW_PDI = 100 * rma(FLOW_PDM / FLOW_ATR_SAFE, flow_di_len)
+local FLOW_MDI = 100 * rma(FLOW_MDM / FLOW_ATR_SAFE, flow_di_len)
+local FLOW_DEN = FLOW_PDI + FLOW_MDI
+local FLOW_DX_RAW = iff(FLOW_DEN == 0, 0, abs(FLOW_PDI - FLOW_MDI) / max(FLOW_DEN, 0.00000001))
+local FLOW_ADX = 100 * rma(FLOW_DX_RAW, flow_adx_len)
+
+-- CHOPPINESS
+local CHOP_TR_SUM = sum(tr, chop_len)
+local CHOP_HIGH = highest(high, chop_len)
+local CHOP_LOW = lowest(low, chop_len)
+local CHOP_RANGE = CHOP_HIGH - CHOP_LOW
+local CHOP_RANGE_SAFE = max(CHOP_RANGE, 0.00000001)
+local CHOP_TR_SAFE = max(CHOP_TR_SUM, 0.00000001)
+local CHOP_LINE = 100 * log(CHOP_TR_SAFE / CHOP_RANGE_SAFE) / log(chop_len)
+
+local function series_value(series, index)
+    if series == nil then return nil end
+    local value = get_value(series[index])
+    if value == nil or isnan(value) then return nil end
+    if value == math.huge or value == -math.huge then return nil end
+    return value
+end
+
+local function candidate_at(s)
+    local o = get_value(open[s])
+    local h = get_value(high[s])
+    local l = get_value(low[s])
+    local c = get_value(close[s])
+
+    local pullback_open = get_value(open[s + 1])
+    local pullback_high = get_value(high[s + 1])
+    local pullback_low = get_value(low[s + 1])
+    local pullback_close = get_value(close[s + 1])
+
+    if o == nil or h == nil or l == nil or c == nil or
+       pullback_open == nil or pullback_high == nil or
+       pullback_low == nil or pullback_close == nil then
+        return 0, 0, false
+    end
+
+    if isnan(o) or isnan(h) or isnan(l) or isnan(c) or
+       isnan(pullback_open) or isnan(pullback_high) or
+       isnan(pullback_low) or isnan(pullback_close) then
+        return 0, 0, false
+    end
+
+    local candle_range = h - l
+    local pullback_range = pullback_high - pullback_low
+
+    if candle_range <= 0 or pullback_range <= 0 then
+        return 0, 0, false
+    end
+
+    local atr_value = series_value(ATR_LINE, s)
+    local pullback_atr_value = series_value(ATR_LINE, s + 1)
+    local fast_value = series_value(FAST_EMA, s)
+    local slow_value = series_value(SLOW_EMA, s)
+    local older_slow = series_value(SLOW_EMA, s + trend_lookback)
+    local older_fast = series_value(FAST_EMA, s + trend_lookback)
+    local fast_pullback = series_value(FAST_EMA, s + 1)
+    local slow_pullback = series_value(SLOW_EMA, s + 1)
+    local sma_value = series_value(SMA_LINE, s)
+    local older_sma = series_value(SMA_LINE, s + trend_lookback)
+    local atr_sma_value = series_value(ATR_SMA, s)
+
+    if atr_value == nil or atr_value <= 0 or
+       pullback_atr_value == nil or pullback_atr_value <= 0 or
+       fast_value == nil or slow_value == nil or older_slow == nil or
+       older_fast == nil or
+       fast_pullback == nil or slow_pullback == nil or
+       sma_value == nil or older_sma == nil then
+        return 0, 0, false
+    end
+
+    -- CHOP com histerese: so bloqueia se 2 candles seguidos acima do limite
+    if use_chop_filter == 1 then
+        local chop_value = series_value(CHOP_LINE, s)
+        local chop_prev = series_value(CHOP_LINE, s + 1)
+        if chop_value == nil or chop_prev == nil then
+            return 0, 0, false
+        end
+        if chop_value >= max_chop and chop_prev >= max_chop then
+            return 0, 0, false
+        end
+    end
+
+    -- Volatilidade adaptativa: em regime de baixa vol noturna, relaxa corpo minimo
+    local effective_min_body = min_body_ratio
+    local effective_chop = max_chop
+    if use_vol_adaptive == 1 and atr_sma_value ~= nil and atr_sma_value > 0 then
+        if atr_value < atr_sma_value * 0.75 then
+            effective_min_body = min_body_ratio * 0.80
+        end
+    end
+
+    local body = math.abs(c - o)
+    local body_ratio = body / candle_range
+    local upper_wick = h - math.max(o, c)
+    local lower_wick = math.min(o, c) - l
+    local close_position = (c - l) / candle_range
+    local pullback_body = math.abs(pullback_close - pullback_open)
+
+    -- PRICE ACTION: engolfo e pin bar
+    local is_bull_engulf = false
+    local is_bear_engulf = false
+    local is_bull_pin = false
+    local is_bear_pin = false
+
+    if use_price_action == 1 then
+        -- Engolfo de alta: abre abaixo do fechamento do pullback e fecha acima da maxima
+        is_bull_engulf = c > pullback_high and o < pullback_close and body > pullback_body * 0.85 and c > o
+        is_bear_engulf = c < pullback_low and o > pullback_close and body > pullback_body * 0.85 and c < o
+        -- Pin bar: pavio oposto > 1.8x corpo e fechamento no extremo
+        is_bull_pin = lower_wick > body * pin_wick_mult and upper_wick < body * 0.9 and close_position >= 0.60 and c > o
+        is_bear_pin = upper_wick > body * pin_wick_mult and lower_wick < body * 0.9 and close_position <= 0.40 and c < o
+    end
+
+    -- Filtro de corpo: permite pin/engolfo mesmo com corpo < threshold
+    local body_ok = body_ratio >= effective_min_body
+    if use_price_action == 1 then
+        if is_bull_engulf or is_bear_engulf or is_bull_pin or is_bear_pin then
+            body_ok = true
+        end
+    end
+    if not body_ok then
+        return 0, 0, false
+    end
+
+    -- Filtro ATR extremo
+    if use_atr_filter == 1 then
+        if candle_range < atr_value * 0.30 or
+           candle_range > atr_value * 1.85 then
+            return 0, 0, false
+        end
+        if pullback_range > pullback_atr_value * max_pullback_range_atr then
+            return 0, 0, false
+        end
+    end
+
+    -- TENDENCIA: inclinacao normalizada por ATR (corrige SMA flat)
+    local fast_slope_atr = (fast_value - older_fast) / atr_value
+    local slow_slope_atr = (slow_value - older_slow) / atr_value
+    local sma_slope_atr = (sma_value - older_sma) / atr_value
+
+    local trend_up = false
+    local trend_down = false
+
+    if use_inclination == 1 then
+        trend_up =
+            fast_value > slow_value and
+            (slow_slope_atr > trend_slope_thr or sma_slope_atr > trend_slope_thr or fast_slope_atr > trend_slope_thr) and
+            c > fast_value and
+            c > sma_value and
+            sma_slope_atr > -0.04
+
+        trend_down =
+            fast_value < slow_value and
+            (slow_slope_atr < -trend_slope_thr or sma_slope_atr < -trend_slope_thr or fast_slope_atr < -trend_slope_thr) and
+            c < fast_value and
+            c < sma_value and
+            sma_slope_atr < 0.04
+    else
+        -- fallback v20 legado
+        trend_up =
+            fast_value > slow_value and
+            slow_value > older_slow and
+            c > fast_value and
+            c > sma_value and
+            sma_value > older_sma
+
+        trend_down =
+            fast_value < slow_value and
+            slow_value < older_slow and
+            c < fast_value and
+            c < sma_value and
+            sma_value < older_sma
+    end
+
+    -- RETRACAO: toque controlado na zona de EMAs
+    local buy_pullback_candle =
+        pullback_close < pullback_open and
+        pullback_low <= fast_pullback + pullback_atr_value * pullback_atr and
+        pullback_low >= slow_pullback - pullback_atr_value * max_slow_ema_penetration
+
+    local sell_pullback_candle =
+        pullback_close > pullback_open and
+        pullback_high >= fast_pullback - pullback_atr_value * pullback_atr and
+        pullback_high <= slow_pullback + pullback_atr_value * max_slow_ema_penetration
+
+    -- CONFIRMACAO: price action refinado
+    local wick_buy_ok = upper_wick / candle_range <= 0.35
+    local wick_sell_ok = lower_wick / candle_range <= 0.35
+    if use_price_action == 1 then
+        -- para pin/engolfo, permite wick maior mas exige rejeicao correta
+        if is_bull_pin or is_bull_engulf then
+            wick_buy_ok = upper_wick < lower_wick
+        end
+        if is_bear_pin or is_bear_engulf then
+            wick_sell_ok = lower_wick < upper_wick
+        end
+    end
+
+    local buy_confirmation =
+        c > o and
+        c > pullback_high and
+        c > fast_value and
+        close_position >= retracement_close_position and
+        wick_buy_ok and
+        math.abs(c - fast_value) <= atr_value * max_extension_atr
+
+    local sell_confirmation =
+        c < o and
+        c < pullback_low and
+        c < fast_value and
+        close_position <= 1 - retracement_close_position and
+        wick_sell_ok and
+        math.abs(c - fast_value) <= atr_value * max_extension_atr
+
+    local normal_buy =
+        c > o and
+        c > pullback_high and
+        c > fast_value and
+        close_position >= retracement_close_position and
+        math.abs(c - fast_value) <= atr_value * max_extension_atr
+
+    local normal_sell =
+        c < o and
+        c < pullback_low and
+        c < fast_value and
+        close_position <= 1 - retracement_close_position and
+        math.abs(c - fast_value) <= atr_value * max_extension_atr
+
+    local direction = 0
+    local is_retracement = false
+
+    if trend_up and buy_pullback_candle and buy_confirmation then
+        direction = 1
+        is_retracement = true
+    elseif trend_down and sell_pullback_candle and sell_confirmation then
+        direction = -1
+        is_retracement = true
+    elseif trend_up and normal_buy then
+        direction = 1
+    elseif trend_down and normal_sell then
+        direction = -1
+    else
+        return 0, 0, false
+    end
+
+    -- FILTRO DE EXAUSTAO: RSI extremos + sequencia
+    local rsi_value = series_value(RSI_LINE, s)
+    if use_exhaustion == 1 and rsi_value ~= nil then
+        if direction == 1 and rsi_value >= rsi_overbought then
+            return 0, 0, false
+        end
+        if direction == -1 and rsi_value <= rsi_oversold then
+            return 0, 0, false
+        end
+        -- sequencia de velas consecutivas mesma cor (overextension)
+        if max_consecutive >= 2 then
+            local consecutive = 0
+            local blocked_by_seq = false
+            for k = s, s + max_consecutive - 1 do
+                local seq_o = get_value(open[k])
+                local seq_c = get_value(close[k])
+                local seq_h = get_value(high[k])
+                local seq_l = get_value(low[k])
+                if seq_o == nil or seq_c == nil or seq_h == nil or seq_l == nil then break end
+                local seq_range = seq_h - seq_l
+                if seq_range <= 0 then break end
+                local seq_body = math.abs(seq_c - seq_o) / seq_range
+                if direction == 1 and seq_c > seq_o and seq_body > 0.45 then
+                    consecutive = consecutive + 1
+                elseif direction == -1 and seq_c < seq_o and seq_body > 0.45 then
+                    consecutive = consecutive + 1
+                else
+                    break
+                end
+                if consecutive >= max_consecutive then
+                    blocked_by_seq = true
+                    break
+                end
+            end
+            if blocked_by_seq then
+                return 0, 0, false
+            end
+        end
+    end
+
+    -- FILTRO de topo/fundo por distancia ATR
+    local recent_high = -math.huge
+    local recent_low = math.huge
+
+    for k = s + 1, s + swing_lookback do
+        local previous_high = get_value(high[k])
+        local previous_low = get_value(low[k])
+
+        if previous_high == nil or previous_low == nil or
+           isnan(previous_high) or isnan(previous_low) then
+            return 0, 0, false
+        end
+
+        if previous_high > recent_high then
+            recent_high = previous_high
+        end
+
+        if previous_low < recent_low then
+            recent_low = previous_low
+        end
+    end
+
+    local extreme_distance = atr_value * extreme_buffer_atr
+
+    if direction == 1 and recent_high - c <= extreme_distance then
+        return 0, 0, false
+    end
+
+    if direction == -1 and c - recent_low <= extreme_distance then
+        return 0, 0, false
+    end
+
+    -- ================================================================
+    -- SISTEMA DE PONTUACAO NOVO 0-10 descorrelacionado
+    -- Cada categoria mede fenomeno diferente, sem dupla contagem
+    -- ================================================================
+    local score = 0
+
+    -- 1) TENDENCIA (0-2)
+    -- +1 alinhamento EMA+SMA+preco
+    if direction == 1 and fast_value > slow_value and c > sma_value then
+        score = score + 1
+    elseif direction == -1 and fast_value < slow_value and c < sma_value then
+        score = score + 1
+    end
+    -- +1 inclinacao forte normalizada
+    if direction == 1 and (slow_slope_atr > 0.14 or sma_slope_atr > 0.14 or fast_slope_atr > 0.18) then
+        score = score + 1
+    elseif direction == -1 and (slow_slope_atr < -0.14 or sma_slope_atr < -0.14 or fast_slope_atr < -0.18) then
+        score = score + 1
+    end
+
+    -- 2) RETRACAO (0-2)
+    -- +1 toque ideal: pullback tocou zona fast com precisao
+    if direction == 1 and buy_pullback_candle and math.abs(pullback_low - fast_pullback) <= pullback_atr_value * 0.35 then
+        score = score + 1
+    elseif direction == -1 and sell_pullback_candle and math.abs(pullback_high - fast_pullback) <= pullback_atr_value * 0.35 then
+        score = score + 1
+    end
+    -- +1 retracacao saudavel: range 0.40-1.20 ATR (nem micro nem enorme)
+    if pullback_range >= pullback_atr_value * 0.40 and pullback_range <= pullback_atr_value * 1.20 then
+        score = score + 1
+    end
+
+    -- 3) PRICE ACTION (0-2)
+    -- +1 fechamento forte no extremo (65->68 mais exigente para score)
+    if direction == 1 and close_position >= 0.68 then
+        score = score + 1
+    elseif direction == -1 and close_position <= 0.32 then
+        score = score + 1
+    end
+    -- +1 engolfo ou pin bar confirmado
+    if direction == 1 and (is_bull_engulf or is_bull_pin) then
+        score = score + 1
+    elseif direction == -1 and (is_bear_engulf or is_bear_pin) then
+        score = score + 1
+    end
+
+    -- 4) MOMENTUM RSI central (0-1): so pontua se RSI na zona ideal, nao exaustao
+    if rsi_value ~= nil then
+        if direction == 1 and rsi_value >= 55 and rsi_value <= 68 then
+            score = score + 1
+        elseif direction == -1 and rsi_value >= 32 and rsi_value <= 45 then
+            score = score + 1
+        end
+    end
+
+    -- 5) VOLATILIDADE golden zone (0-1): candle nem doji nem esticado
+    if candle_range >= atr_value * 0.55 and candle_range <= atr_value * 1.45 then
+        score = score + 1
+    end
+
+    -- 6) DISTANCIA DE EXTREMO (0-1): afastado de topo/fundo recente
+    if direction == 1 and recent_high - c >= atr_value * 0.70 then
+        score = score + 1
+    elseif direction == -1 and c - recent_low >= atr_value * 0.70 then
+        score = score + 1
+    end
+
+    -- 7) ANTI-EXAUSTAO (0-1): sem sequencia longa e range nao excessivo (complemento)
+    -- Se chegou aqui, ja passou filtro de sequencia, mas pontua extra por nao estar perto do limite
+    if rsi_value ~= nil then
+        if direction == 1 and rsi_value < 66 and candle_range < atr_value * 1.60 then
+            score = score + 1
+        elseif direction == -1 and rsi_value > 34 and candle_range < atr_value * 1.60 then
+            score = score + 1
+        elseif rsi_value == nil and candle_range < atr_value * 1.60 then
+            score = score + 1
+        end
+    end
+
+    -- FLUXO ADX como bonus hibrido: se habilitado e forte, pode dar +1 extra mas capped em 10
+    if use_flow_score == 1 then
+        local adx_value = series_value(FLOW_ADX, s)
+        local pdi_value = series_value(FLOW_PDI, s)
+        local mdi_value = series_value(FLOW_MDI, s)
+        if adx_value ~= nil and pdi_value ~= nil and mdi_value ~= nil and adx_value >= flow_threshold then
+            if direction == 1 and pdi_value > mdi_value and score < 10 then
+                score = score + 1
+            elseif direction == -1 and mdi_value > pdi_value and score < 10 then
+                score = score + 1
+            end
+            if score > 10 then score = 10 end
+        end
+    end
+
+    if score > 10 then score = 10 end
+
+    return direction, score, is_retracement
+end
+
+local function entry_open_ok(direction)
+    if use_open_filter == 0 then return true end
+
+    local current_open = get_value(open)
+    local previous_close = get_value(close[1])
+    local previous_high = get_value(high[1])
+    local previous_low = get_value(low[1])
+
+    if current_open == nil or previous_close == nil or
+       previous_high == nil or previous_low == nil then
+        return false
+    end
+
+    local previous_range = previous_high - previous_low
+    if previous_range <= 0 then return false end
+
+    local gap = current_open - previous_close
+
+    if math.abs(gap) > previous_range * 0.30 then
+        return false
+    end
+
+    if direction == 1 and current_open < (previous_low + previous_close) / 2 then
+        return false
+    end
+
+    if direction == -1 and current_open > (previous_high + previous_close) / 2 then
+        return false
+    end
+
+    return true
+end
+
+local signal_direction = 0
+local signal_score = 0
+local signal_is_retracement = false
+local preliminary_direction = 0
+local preliminary_score = 0
+
+local candidate, score, is_retracement = candidate_at(1)
+
+if candidate ~= 0 and score >= min_score then
+    local blocked_by_recent_signal = false
+
+    for k = 2, min_gap + 1 do
+        local old_direction, old_score = candidate_at(k)
+
+        if old_direction ~= 0 and old_score >= min_score then
+            blocked_by_recent_signal = true
+            break
+        end
+    end
+
+    if not blocked_by_recent_signal and entry_open_ok(candidate) then
+        signal_direction = candidate
+        signal_score = score
+        signal_is_retracement = is_retracement
+    end
+end
+
+if show_pre == 1 and signal_direction == 0 then
+    local preliminary, pre_score = candidate_at(0)
+
+    if preliminary ~= 0 and pre_score >= min_score then
+        preliminary_direction = preliminary
+        preliminary_score = pre_score
+    end
+end
+
+-- Classificacao visual: C+/P+ so para score >=8 (alta qualidade real)
+local buy_mark = signal_score >= 8 and "C+" or "C"
+local sell_mark = signal_score >= 8 and "P+" or "P"
+
+plot_shape(
+    conditional(signal_direction == 1 and not signal_is_retracement),
+    "COMPRA",
+    shape_style.arrowup,
+    SIG_SIZE,
+    buy_color,
+    shape_location.belowbar,
+    PLOT_OFFSET,
+    buy_mark,
+    buy_color
+)
+
+plot_shape(
+    conditional(signal_direction == 1 and signal_is_retracement),
+    "COMPRA RETRACAO",
+    shape_style.arrowup,
+    SIG_SIZE,
+    buy_color,
+    shape_location.belowbar,
+    PLOT_OFFSET,
+    "C RET",
+    buy_color
+)
+
+plot_shape(
+    conditional(signal_direction == -1 and not signal_is_retracement),
+    "VENDA",
+    shape_style.arrowdown,
+    SIG_SIZE,
+    sell_color,
+    shape_location.abovebar,
+    PLOT_OFFSET,
+    sell_mark,
+    sell_color
+)
+
+plot_shape(
+    conditional(signal_direction == -1 and signal_is_retracement),
+    "VENDA RETRACAO",
+    shape_style.arrowdown,
+    SIG_SIZE,
+    sell_color,
+    shape_location.abovebar,
+    PLOT_OFFSET,
+    "P RET",
+    sell_color
+)
+
+plot_shape(
+    conditional(preliminary_direction == 1),
+    "PRELIMINAR COMPRA",
+    shape_style.diamond,
+    PRE_SIZE,
+    pre_color,
+    shape_location.belowbar,
+    0,
+    "C?",
+    pre_color
+)
+
+plot_shape(
+    conditional(preliminary_direction == -1),
+    "PRELIMINAR VENDA",
+    shape_style.diamond,
+    PRE_SIZE,
+    pre_color,
+    shape_location.abovebar,
+    0,
+    "P?",
+    pre_color
+)
+
+if signal_direction == 1 then
+    advise(advice.buy)
+elseif signal_direction == -1 then
+    advise(advice.sell)
+else
+    advise(advice.neutral)
+end
